@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Serveurs Menu Graphique"
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: "vpc-lab-2"
+  ProjectName:
+    Type: String
+    Default: "lab2"
+  EnvironmentType:
+    Type: String
+    Default: "Prod"
+    AllowedValues: [Test, Prod]
+  KeyPairName:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Default: "vockey_public"
+  S3InstallBucket:
+    Type: String
+    Default: "menugraphique-2026-hiver-01"
+  LicenseKey:
+    Type: String
+  DbUser:
+    Type: String
+    Default: "admin"
+  DbPass:
+    NoEcho: true
+    Type: String
+
+Resources:
+  # --- GROUPES DE SECURITE ---
+  WebSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Web Security"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: "0.0.0.0/0" }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8081, CidrIp: "0.0.0.0/0" }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${NetworkStackName}-JumpboxSGId" } }
+
+  LicenceSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Licence Security"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 9090, ToPort: 9090, CidrIp: "0.0.0.0/0" }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${NetworkStackName}-JumpboxSGId" } }
+
+  DbSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "DB Security"
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3360, ToPort: 3360, SourceSecurityGroupId: !Ref WebSG }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${NetworkStackName}-JumpboxSGId" } }
+
+  # --- INSTANCES ---
+  DbInstance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: "t2.micro"
+      ImageId: "ami-0c101f26f147fa7fd"
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: "LabInstanceProfile"
+      SecurityGroupIds: [ !Ref DbSG ]
+      SubnetId: !ImportValue { "Fn::Sub": "${NetworkStackName}-PrivateSubnet1Id" }
+      Tags: [{ Key: Layer, Value: bd }, { Key: Project, Value: !Ref ProjectName }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf install -y mariadb105-server
+          echo -e "[mariadb]\nport=3360" > /etc/my.cnf.d/z-custom-port.cnf
+          systemctl enable --now mariadb
+          mariadb -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${DbPass}';"
+          mariadb -u root -p"${DbPass}" -e "CREATE USER '${DbUser}'@'%' IDENTIFIED BY '${DbPass}';"
+          mariadb -u root -p"${DbPass}" -e "GRANT ALL PRIVILEGES ON *.* TO '${DbUser}'@'%'; FLUSH PRIVILEGES;"
+
+  WebInstance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: "t2.micro"
+      ImageId: "ami-0c101f26f147fa7fd"
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: "LabInstanceProfile"
+      SecurityGroupIds: [ !Ref WebSG ]
+      SubnetId: !ImportValue { "Fn::Sub": "${NetworkStackName}-PublicSubnet1Id" }
+      Tags: [{ Key: Layer, Value: www }, { Key: Project, Value: !Ref ProjectName }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf install nginx java-21-amazon-corretto-headless -y
+          rm -rf /usr/share/nginx/html/*
+          aws s3 cp s3://${S3InstallBucket}/ind250-MenuGraphique-main/ /usr/share/nginx/html/ --recursive
+          systemctl enable --now nginx
+          useradd --system superserver
+          mkdir -p /opt/superserver /etc/superserver
+          aws s3 cp s3://${S3InstallBucket}/ind250-Artifact-main/WebServer/WebServer-0.0.1-SNAPSHOT.jar /opt/superserver/WebServer.jar
+          aws s3 cp s3://${S3InstallBucket}/ind250-Artifact-main/ImageWorker/ImageWorker-0.0.1-SNAPSHOT-jar-with-dependencies.jar /opt/superserver/ImageWorker.jar
+          cat > /etc/superserver/webserver.env <<EOF
+          WEBSERVER_PORT=8080
+          WEBSERVER_DBHOST=${DbInstance.PrivateIp}
+          WEBSERVER_DBPORT=3360
+          WEBSERVER_DBUSER=${DbUser}
+          WEBSERVER_DBPASS=${DbPass}
+          EOF
+          cat > /etc/systemd/system/superserver-webserver.service <<EOF
+          [Unit]
+          Description=IND250 WebServer
+          After=network-online.target
+          [Service]
+          Type=simple
+          User=superserver
+          WorkingDirectory=/opt/superserver
+          EnvironmentFile=/etc/superserver/webserver.env
+          ExecStart=/usr/bin/java -jar /opt/superserver/WebServer.jar
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          chown -R superserver:superserver /opt/superserver
+          systemctl daemon-reload
+          systemctl enable --now superserver-webserver
+
+  LicenceInstance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: "t2.micro"
+      ImageId: "ami-0c101f26f147fa7fd"
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: "LabInstanceProfile"
+      SecurityGroupIds: [ !Ref LicenceSG ]
+      SubnetId: !ImportValue { "Fn::Sub": "${NetworkStackName}-PublicSubnet1Id" }
+      Tags: [{ Key: Layer, Value: licence }, { Key: Project, Value: !Ref ProjectName }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf install -y nodejs
+          mkdir -p /opt/menugraphique-license
+          cd /opt/menugraphique-license
+          aws s3 cp s3://${S3InstallBucket}/ind250-SecureServer-master/ /opt/menugraphique-license/ --recursive
+          npm install
+          cat <<EOF > /etc/sysconfig/menugraphique-license
+          LICENSE_KEY=${LicenseKey}
+          IND250_SECURE_SERVER_PORT=9090
+          EOF
+          cat <<EOF > /etc/systemd/system/menugraphique-license.service
+          [Unit]
+          Description=MenuGraphique License Server
+          After=network.target
+          [Service]
+          EnvironmentFile=/etc/sysconfig/menugraphique-license
+          WorkingDirectory=/opt/menugraphique-license
+          ExecStart=/usr/bin/node index.js
+          Restart=always
+          User=ec2-user
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now menugraphique-license
+
+Outputs:
+  WebPublicIp: { Value: !GetAtt WebInstance.PublicIp }
+  DbPrivateIp: { Value: !GetAtt DbInstance.PrivateIp }
+  LicencePublicIp: { Value: !GetAtt LicenceInstance.PublicIp }

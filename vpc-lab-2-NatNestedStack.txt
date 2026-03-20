@@ -1,0 +1,235 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Transform": "AWS::LanguageExtensions",
+  "Description": "Creer et demarer un NAT instance dans le subnet public et creer les tables de routage pour les sous reseaux privees.",
+  "Metadata": {
+    "RequisTechnique": "Pour que l'instance NAT obtienne une addresse IP public, le InternetGateway doit etre assoccie au vpc avant d'executer ce script. Le nom du stack est utilise pour nommer les ressources",
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": {
+            "default": "Network Configuration for NAT instance"
+          },
+          "Parameters": [
+            "VpcId",
+            "PublicSubnetId",
+            "PrivatesSubnetsID",
+            "KeyPairName"
+          ]
+        },
+        {
+          "Label": {
+            "default": "Advanced Configuration"
+          },
+          "Parameters": [
+            "AMIId"
+          ]
+        }
+      ],
+      "ParameterLabels": {}
+    }
+  },
+  "Parameters": {
+    "VpcId": {
+      "Description": "ID of an existing Virtual Private Cloud (VPC) for the NAT instance.",
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "PublicSubnetId": {
+      "Description": "ID of an existing public subnet within the specified VPC for the NAT instance.",
+      "Type": "AWS::EC2::Subnet::Id"
+    },
+    "PrivatesSubnetsID": {
+      "Description": "ID of all existing privates subnets within the specified VPC.",
+      "Type": "List<AWS::EC2::Subnet::Id>"
+    },
+    "AMIId": {
+      "Description": "Name of a Parameter Store parameter that stores the ID of the Amazon Machine Image (AMI).",
+      "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
+      "Default": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+      "AllowedValues": [
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+      ]
+    },
+    "KeyPairName": {
+      "Description": "Name of an existing EC2 KeyPair to enable remote access to the NAT instance",
+      "Type": "AWS::EC2::KeyPair::KeyName",
+      "ConstraintDescription": "must be the name of an existing EC2 KeyPair."
+    }
+  },
+  "Mappings": {},
+  "Conditions": {},
+  "Resources": {
+    "InstanceSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupName": "Nat SecurityGroup",
+        "GroupDescription": "Accept all trafic (NAT instance security-groupe)",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "NatEIP": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "InstanceId": {
+          "Ref": "NatInstance"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-NAT-EIP"
+            }
+          }
+        ]
+      }
+    },
+    "NatInstance": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "KeyName": {
+          "Ref": "KeyPairName"
+        },
+        "ImageId": {
+          "Ref": "AMIId"
+        },
+        "InstanceType": "t2.micro",
+        "SourceDestCheck": false,
+        "NetworkInterfaces": [
+          {
+            "AssociatePublicIpAddress": "true",
+            "DeviceIndex": "0",
+            "SubnetId": {
+              "Ref": "PublicSubnetId"
+            },
+            "GroupSet": [
+              {
+                "Ref": "InstanceSecurityGroup"
+              }
+            ]
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": "#!/bin/bash\nsudo yum install iptables-services -y\nsudo systemctl enable iptables\nsudo systemctl start iptables\nsudo touch /etc/sysctl.d/custom-ip-forwarding.conf\nsudo sh -c 'echo \"net.ipv4.ip_forward=1\" >> /etc/sysctl.d/custom-ip-forwarding.conf'\nsudo sysctl -p /etc/sysctl.d/custom-ip-forwarding.conf\nINTERFACE=\"$(route | grep '^default' | grep -o '[^ ]*$')\"\nsudo /sbin/iptables -t nat -A POSTROUTING -o \"$INTERFACE\" -j MASQUERADE\nsudo /sbin/iptables -F FORWARD\nsudo service iptables save\n"
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${AWS::StackName}-NatInstance"
+            }
+          }
+        ]
+      }
+    },
+    "NatRouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VpcId"
+        }
+      }
+    },
+    "S3GatewayEndpoint": {
+      "Type": "AWS::EC2::VPCEndpoint",
+      "Properties": {
+        "VpcEndpointType": "Gateway",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "ServiceName": {
+          "Fn::Sub": "com.amazonaws.${AWS::Region}.s3"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "*",
+              "Resource": "*"
+            }
+          ]
+        },
+        "RouteTableIds": [
+          {
+            "Ref": "NatRouteTable"
+          }
+        ]
+      }
+    },
+    "NatRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "NatRouteTable"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "InstanceId": {
+          "Ref": "NatInstance"
+        }
+      }
+    },
+    "Fn::ForEach::NatAssoc": [
+      "privateSubnetId",
+      {
+        "Ref": "PrivatesSubnetsID"
+      },
+      {
+        "NatAssociation&{privateSubnetId}": {
+          "Type": "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties": {
+            "RouteTableId": {
+              "Ref": "NatRouteTable"
+            },
+            "SubnetId": {
+              "Ref": "privateSubnetId"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "Outputs": {
+    "NatInstanceId": {
+      "Value": {
+        "Ref": "NatInstance"
+      }
+    },
+    "NatInstancePrivateIp": {
+      "Value": {
+        "Fn::GetAtt": [
+          "NatInstance",
+          "PrivateIp"
+        ]
+      }
+    },
+    "NatInstancePublicIp": {
+      "Value": {
+        "Fn::GetAtt": [
+          "NatEIP",
+          "PublicIp"
+        ]
+      }
+    },
+    "NatInstanceSecurityGroup": {
+      "Value": {
+        "Ref": "InstanceSecurityGroup"
+      }
+    }
+  }
+}

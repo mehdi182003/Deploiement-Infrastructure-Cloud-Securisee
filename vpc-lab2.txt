@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lab 2 - Infrastructure REseau (VPC, Subnets, NAT, Jumpbox SG)'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuration du Projet"
+        Parameters:
+          - ProjectName
+          - EnvironmentType
+      - Label:
+          default: "Configuration R?seau"
+        Parameters:
+          - VpcCidr
+          - InstanceBits
+      - Label:
+          default: "D?pendances"
+        Parameters:
+          - NatTemplateUrl
+          - KeyPairName
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Nom du projet (3 a 100 caractéres alphanumériques).
+    AllowedPattern: '^[a-zA-Z0-9]{3,100}$'
+  EnvironmentType:
+    Type: String
+    Description: Type d'environnement.
+    AllowedValues:
+      - Test
+      - Prod
+  VpcCidr:
+    Type: String
+    Description: Plage CIDR du VPC.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Default: '10.0.0.0/16'
+  InstanceBits:
+    Type: Number
+    Description: Nombre de bits pour identifier les instances (entre 4 et 16).
+    MinValue: 4
+    MaxValue: 16
+    Default: 8
+  NatTemplateUrl:
+    Type: String
+    Description: URL S3 du script NatInstance.json
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Cl? SSH pour le NAT.
+
+Conditions:
+  IsProd: !Equals [ !Ref EnvironmentType, "Prod" ]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 0, !Cidr [ !Ref VpcCidr, 4, !Ref InstanceBits ] ]
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicSubnet1'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnet2:
+    Condition: IsProd
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 1, !Cidr [ !Ref VpcCidr, 4, !Ref InstanceBits ] ]
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicSubnet2'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 2, !Cidr [ !Ref VpcCidr, 4, !Ref InstanceBits ] ]
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PrivateSubnet1'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet2:
+    Condition: IsProd
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 3, !Cidr [ !Ref VpcCidr, 4, !Ref InstanceBits ] ]
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PrivateSubnet2'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicRT'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Condition: IsProd
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  JumpboxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow SSH to Jumpbox'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-JumpboxSG'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatNestedStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      TemplateURL: !Ref NatTemplateUrl
+      Parameters:
+        VpcId: !Ref VPC
+        PublicSubnetId: !Ref PublicSubnet1
+        PrivatesSubnetsID: !If [ IsProd, !Join [ ",", [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ], !Join [ ",", [ !Ref PrivateSubnet1 ] ] ]
+        KeyPairName: !Ref KeyPairName
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+  JumpboxSecurityGroupId:
+    Value: !Ref JumpboxSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-JumpboxSGId'
